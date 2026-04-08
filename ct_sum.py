@@ -59,6 +59,12 @@ def get_feature_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def evaluate(y_true, y_pred, y_score):
+    """
+    y_score 必須符合：
+    分數越大，越傾向 label = 1
+    這裡會傳入 reversed_ct_sum = -ct_sum
+    因為原始 CTsum 越大越傾向 0
+    """
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
@@ -66,7 +72,7 @@ def evaluate(y_true, y_pred, y_score):
         "AUROC": roc_auc_score(y_true, y_score),
         "AUPRC": average_precision_score(y_true, y_score),
         "Accuracy": accuracy_score(y_true, y_pred),
-        "F1": f1_score(y_true, y_pred),
+        "F1": f1_score(y_true, y_pred, zero_division=0),
         "TNR": safe_div(tn, tn + fp),
         "TPR": safe_div(tp, tp + fn),
         "PPV": safe_div(tp, tp + fp),
@@ -80,14 +86,49 @@ def evaluate(y_true, y_pred, y_score):
 
 
 def find_best_threshold_by_youden(y_true, y_score):
+    """
+    y_score 必須是「分數越大越傾向 label=1」
+    會排除 roc_curve 回傳的 inf threshold
+    """
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+
+    if len(np.unique(y_true)) < 2:
+        raise ValueError("y_true 只有單一類別，無法計算 ROC threshold。")
+
+    if np.isnan(y_score).any() or np.isinf(y_score).any():
+        raise ValueError("y_score 含有 NaN 或 inf，無法計算 ROC threshold。")
+
+    if np.unique(y_score).shape[0] < 2:
+        raise ValueError("y_score 全部相同，無法找到有效 threshold。")
+
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
     j_scores = tpr - fpr
-    best_idx = np.argmax(j_scores)
-    best_threshold = thresholds[best_idx]
-    return best_threshold, fpr[best_idx], tpr[best_idx], j_scores[best_idx]
+
+    finite_mask = np.isfinite(thresholds)
+    if finite_mask.sum() == 0:
+        raise ValueError("thresholds 全部都是 inf，無法找到有效 threshold。")
+
+    valid_thresholds = thresholds[finite_mask]
+    valid_fpr = fpr[finite_mask]
+    valid_tpr = tpr[finite_mask]
+    valid_j = j_scores[finite_mask]
+
+    best_idx = np.argmax(valid_j)
+
+    return (
+        valid_thresholds[best_idx],
+        valid_fpr[best_idx],
+        valid_tpr[best_idx],
+        valid_j[best_idx]
+    )
 
 
 def compute_ct_sum(ct_df: pd.DataFrame) -> np.ndarray:
+    """
+    每一列是一筆樣本，每一欄是一個特徵 CT 值
+    axis=1 表示把同一筆樣本的所有特徵 CT 值加總
+    """
     return ct_df.sum(axis=1).values
 
 
@@ -118,6 +159,9 @@ def save_confusion_matrix_image(cm, save_path, title="Confusion Matrix"):
 
 
 def save_roc_curve(y_true, y_score, save_path):
+    """
+    y_score 必須符合：分數越大越傾向 label=1
+    """
     fpr, tpr, _ = roc_curve(y_true, y_score)
     auc_score = roc_auc_score(y_true, y_score)
 
@@ -134,6 +178,9 @@ def save_roc_curve(y_true, y_score, save_path):
 
 
 def save_pr_curve(y_true, y_score, save_path):
+    """
+    y_score 必須符合：分數越大越傾向 label=1
+    """
     precision, recall, _ = precision_recall_curve(y_true, y_score)
     auprc = average_precision_score(y_true, y_score)
 
@@ -155,6 +202,7 @@ def save_pr_curve(y_true, y_score, save_path):
 def ctsum_model_output(X):
     """
     SHAP 解釋用的模型輸出函式
+    這裡保留原始 CTsum 本身
     輸入: numpy array 或 DataFrame
     輸出: CTsum 分數
     """
@@ -272,6 +320,19 @@ train_ct_sum = compute_ct_sum(ct_train_df)
 val_ct_sum = compute_ct_sum(ct_val_df)
 test_ct_sum = compute_ct_sum(ct_test_df)
 
+# 你的定義：
+# CTsum 越大越傾向 0
+# CTsum 越小越傾向 1
+# 因此要轉成 sklearn 慣用方向：分數越大越傾向 1
+val_score = -val_ct_sum
+test_score = -test_ct_sum
+
+print("Direction check:")
+print("val ct_sum label=0 mean:", val_ct_sum[y_val == 0].mean() if np.sum(y_val == 0) > 0 else "N/A")
+print("val ct_sum label=1 mean:", val_ct_sum[y_val == 1].mean() if np.sum(y_val == 1) > 0 else "N/A")
+print("val score (-ct_sum) label=0 mean:", val_score[y_val == 0].mean() if np.sum(y_val == 0) > 0 else "N/A")
+print("val score (-ct_sum) label=1 mean:", val_score[y_val == 1].mean() if np.sum(y_val == 1) > 0 else "N/A")
+
 
 # ===============================
 # Step5: validation 找最佳 threshold
@@ -281,7 +342,7 @@ print("Finding best threshold on validation set...")
 
 best_threshold, best_fpr, best_tpr, best_j = find_best_threshold_by_youden(
     y_val,
-    val_ct_sum
+    val_score
 )
 
 print(f"Best threshold = {best_threshold:.6f}")
@@ -296,8 +357,10 @@ print(f"Val TPR        = {best_tpr:.6f}")
 
 print("Evaluating on test set...")
 
-y_test_pred = (test_ct_sum >= best_threshold).astype(int)
-metrics = evaluate(y_test, y_test_pred, test_ct_sum)
+# 注意：是對 test_score 判斷，不是原始 test_ct_sum
+y_test_pred = (test_score >= best_threshold).astype(int)
+
+metrics = evaluate(y_test, y_test_pred, test_score)
 metrics["Best_Threshold"] = best_threshold
 
 print("Test metrics:")
@@ -313,6 +376,7 @@ print("Saving CT datasets...")
 
 ct_train_save = ct_train_df.copy()
 ct_train_save["ct_sum"] = train_ct_sum
+ct_train_save["score_for_label1"] = -train_ct_sum
 ct_train_save["label"] = y_train
 ct_train_save.to_csv(
     os.path.join(RESULT_DIR, "ct_train.csv"),
@@ -321,6 +385,7 @@ ct_train_save.to_csv(
 
 ct_val_save = ct_val_df.copy()
 ct_val_save["ct_sum"] = val_ct_sum
+ct_val_save["score_for_label1"] = val_score
 ct_val_save["label"] = y_val
 ct_val_save.to_csv(
     os.path.join(RESULT_DIR, "ct_val.csv"),
@@ -329,6 +394,7 @@ ct_val_save.to_csv(
 
 ct_test_save = ct_test_df.copy()
 ct_test_save["ct_sum"] = test_ct_sum
+ct_test_save["score_for_label1"] = test_score
 ct_test_save["label"] = y_test
 ct_test_save["pred"] = y_test_pred
 ct_test_save.to_csv(
@@ -360,7 +426,7 @@ threshold_df.to_csv(
 
 
 # ===============================
-# Step9: 畫原本的評估圖
+# Step9: 畫評估圖
 # ===============================
 
 print("Saving evaluation plots...")
@@ -373,15 +439,16 @@ save_confusion_matrix_image(
     title="CTsum Confusion Matrix"
 )
 
+# 這裡也要用 test_score，而不是原始 test_ct_sum
 save_roc_curve(
     y_test,
-    test_ct_sum,
+    test_score,
     os.path.join(RESULT_DIR, "roc_curve.png")
 )
 
 save_pr_curve(
     y_test,
-    test_ct_sum,
+    test_score,
     os.path.join(RESULT_DIR, "pr_curve.png")
 )
 
@@ -392,22 +459,16 @@ save_pr_curve(
 
 print("Computing SHAP for CTsum...")
 
-# 背景資料抽樣，避免太慢
 background_size = min(200, len(ct_train_df))
 background_df = ct_train_df.sample(n=background_size, random_state=42)
 
-# 使用 Independent masker + Explainer
 explainer = shap.Explainer(
     ctsum_model_output,
     background_df
 )
 
-# 測試資料若太大可抽樣，避免速度太慢
 test_explain_df = ct_test_df.copy()
-
 shap_exp = explainer(test_explain_df)
-
-# shap values
 shap_values = np.array(shap_exp.values)
 
 if shap_values.shape != test_explain_df.shape:
@@ -421,6 +482,7 @@ shap_df.insert(0, "sample_index", np.arange(len(shap_df)))
 shap_df["label"] = y_test
 shap_df["pred"] = y_test_pred
 shap_df["ct_sum"] = test_ct_sum
+shap_df["score_for_label1"] = test_score
 
 shap_df.to_csv(
     os.path.join(RESULT_DIR, "ctsum_shap_values.csv"),
